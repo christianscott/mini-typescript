@@ -63,6 +63,7 @@ Token *token_create(TokenType type, char *text) {
 }
 
 typedef struct {
+    Token *prev_token;
     Token *token;
     size_t pos;
     char *source;
@@ -72,6 +73,7 @@ typedef struct {
 Lexer *lexer_create(char *source) {
     Lexer *lexer = malloc(sizeof(Lexer));
     lexer->token = NULL;
+    lexer->prev_token = NULL;
     lexer->pos = 0;
     lexer->source = source;
     lexer->source_len = strlen(source);
@@ -110,6 +112,14 @@ bool is_identifier_char(char c) {
     return is_alphanumeric(c) || c == '_';
 }
 
+void lexer_set_token(Lexer *lexer, Token *token) {
+    if (lexer->prev_token != NULL) {
+        free(lexer->prev_token);
+    }
+    lexer->prev_token = lexer->token;
+    lexer->token = token;
+}
+
 void lexer_scan(Lexer *lexer) {
     if (lexer->token != NULL && lexer->token->type == TOK_END_OF_FILE) {
         return;
@@ -121,7 +131,7 @@ void lexer_scan(Lexer *lexer) {
 
     size_t start = lexer->pos;
     if (!lexer_has_more_chars(lexer)) {
-        lexer->token = token_create(TOK_END_OF_FILE, "EOF");
+        lexer_set_token(lexer, token_create(TOK_END_OF_FILE, "EOF"));
         return;
     }
 
@@ -131,7 +141,7 @@ void lexer_scan(Lexer *lexer) {
         }
 
         char *text = substr(lexer->source, start, lexer->pos);
-        lexer->token = token_create(TOK_NUMBER, text);
+        lexer_set_token(lexer, token_create(TOK_NUMBER, text));
         return;
     }
 
@@ -153,7 +163,7 @@ void lexer_scan(Lexer *lexer) {
         } else {
             type = TOK_IDENT;
         }
-        lexer->token = token_create(type, text);
+        lexer_set_token(lexer, token_create(type, text));
         return;
     }
 
@@ -374,6 +384,38 @@ Parser *parser_create(Lexer *lexer) {
     return parser;
 }
 
+void parser_print_error_context(Parser *parser) {
+    size_t pos = parser->lexer->pos;
+
+    size_t line_start = pos;
+    size_t line_end = pos;
+    while (parser->lexer->source[line_start - 1] != '\n' && line_start > 0) {
+        line_start--;
+    }
+    while (parser->lexer->source[line_end] != '\n' && line_end < parser->lexer->source_len) {
+        line_end++;
+    }
+
+    char *current_line = substr(parser->lexer->source, line_start, line_end + 1);
+    fprintf(stderr, "%s", current_line);
+
+    size_t padding_size = pos - line_start - 1;
+    char *padding = malloc(sizeof(char) * padding_size);
+    for (size_t i = 0; i < padding_size; i++) {
+        padding[i] = ' ';
+    }
+
+    fprintf(stderr, "%s^ ", padding);
+}
+
+#define PARSER_ERROR(...) \
+    do {                  \
+        if (parser->has_errors) break; \
+        parser->has_errors = true; \
+        parser_print_error_context(parser); \
+        fprintf(stderr, __VA_ARGS__); \
+    } while (0)
+
 bool parser_try_parse_token(Parser *parser, TokenType type) {
     bool ok = parser->lexer->token != NULL && parser->lexer->token->type == type;
     if (ok) {
@@ -385,9 +427,9 @@ bool parser_try_parse_token(Parser *parser, TokenType type) {
 ParseResult parser_expect_token(Parser *parser, TokenType type) {
     bool ok = parser_try_parse_token(parser, type);
     if (!ok) {
-        fprintf(stderr, "expected a token of type %s, got %s\n", token_type_name(type),
-                token_type_name(parser->lexer->token->type));
-        parser->has_errors = true;
+        PARSER_ERROR("expected a token of type %s, got %s\n",
+                     token_type_name(type),
+                     token_type_name(parser->lexer->token->type));
         return PARSE_RESULT_UNEXPECTED_TOK;
     }
     return PARSE_RESULT_OK;
@@ -405,17 +447,14 @@ ParseResult parse_identifier_or_literal(Parser *parser, Expr *expr) {
         char *end_ptr;
         double value = strtod(parser->lexer->token->text, &end_ptr);
         if (errno == ERANGE) {
-            fprintf(stderr, "failed to parse as double: %s\n", parser->lexer->token->text);
-            parser->has_errors = true;
+            PARSER_ERROR("could not parse as double: %s\n", parser->lexer->token->text);
             return PARSE_RESULT_INVALID_NUMERIC_LITERAL;
         }
         *expr = expr_num_create(location, value);
         return PARSE_RESULT_OK;
     }
 
-    fprintf(stderr, "expected identifier or a literal but got %s\n", token_type_name(parser->lexer->token->type));
-    parser->has_errors = true;
-
+    PARSER_ERROR("expected identifier or a literal but got %s\n", token_type_name(parser->lexer->token->type));
     return PARSE_RESULT_UNEXPECTED_TOK;
 }
 
@@ -442,8 +481,7 @@ ParseResult parse_identifier(Parser *parser, Ident *ident) {
         return PARSE_RESULT_OK;
     }
 
-    fprintf(stderr, "expected identifier but got a token of type %s\n", token_type_name(parser->lexer->token->type));
-    parser->has_errors = true;
+    PARSER_ERROR("expected identifier but got a literal\n");
     return PARSE_RESULT_UNEXPECTED_TOK;
 }
 
@@ -491,17 +529,42 @@ ParseResult parse_stmt(Parser *parser, Stmt *stmt) {
     return PARSE_RESULT_OK;
 }
 
+void parser_synchronize(Parser *parser) {
+    lexer_scan(parser->lexer);
+
+    while (!lexer_has_more_chars(parser->lexer)) {
+        Token *prev_token = parser->lexer->prev_token;
+        if (prev_token != NULL && prev_token->type == TOK_SEMICOLON) {
+            return;
+        }
+
+        switch (parser->lexer->token->type) {
+            case TOK_LET:
+            case TOK_FUNCTION:
+            case TOK_TYPE:
+            case TOK_RETURN:
+                return;
+            default:
+                break;
+        }
+
+        lexer_scan(parser->lexer);
+    }
+}
+
 ParseResult parser_parse_module(Parser *parser, Module *mod) {
     lexer_scan(parser->lexer);
     if (parser_try_parse_token(parser, TOK_END_OF_FILE)) {
         return PARSE_RESULT_OK;
     }
 
+    ParseResult res;
     while (true) {
         Stmt stmt;
-        ParseResult res = parse_stmt(parser, &stmt);
+        res = parse_stmt(parser, &stmt);
         if (res != PARSE_RESULT_OK) {
-            return res;
+            parser_synchronize(parser);
+            parser->has_errors = false;
         }
         sb_push(mod->statements, stmt);
 
@@ -510,7 +573,7 @@ ParseResult parser_parse_module(Parser *parser, Module *mod) {
         }
     }
 
-    return PARSE_RESULT_OK;
+    return res;
 }
 
 ParseResult parser_parse(Parser *parser, Module *module) {
