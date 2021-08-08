@@ -342,6 +342,31 @@ typedef struct {
     bool has_errors;
 } Parser;
 
+typedef enum {
+    PARSE_RESULT_OK,
+    PARSE_RESULT_UNEXPECTED_TOK,
+    PARSE_RESULT_INVALID_NUMERIC_LITERAL,
+} ParseResult;
+
+char *parse_result_name(ParseResult res) {
+    switch (res) {
+        case PARSE_RESULT_OK:
+            return "PARSE_RESULT_OK";
+        case PARSE_RESULT_UNEXPECTED_TOK:
+            return "PARSE_RESULT_UNEXPECTED_TOK";
+        case PARSE_RESULT_INVALID_NUMERIC_LITERAL:
+            return "PARSE_RESULT_INVALID_NUMERIC_LITERAL";
+        default:
+            return "(unknown)";
+    }
+}
+
+#define TRY_PARSE(__expr) \
+    do { \
+        ParseResult __res = __expr; \
+        if (__res != PARSE_RESULT_OK) return __res; \
+    } while (0)
+
 Parser *parser_create(Lexer *lexer) {
     Parser *parser = malloc(sizeof(Parser));
     parser->lexer = lexer;
@@ -357,20 +382,23 @@ bool parser_try_parse_token(Parser *parser, TokenType type) {
     return ok;
 }
 
-void parser_expect_token(Parser *parser, TokenType type) {
+ParseResult parser_expect_token(Parser *parser, TokenType type) {
     bool ok = parser_try_parse_token(parser, type);
     if (!ok) {
         fprintf(stderr, "expected a token of type %s, got %s\n", token_type_name(type),
                 token_type_name(parser->lexer->token->type));
         parser->has_errors = true;
+        return PARSE_RESULT_UNEXPECTED_TOK;
     }
+    return PARSE_RESULT_OK;
 }
 
-Expr parse_identifier_or_literal(Parser *parser) {
+ParseResult parse_identifier_or_literal(Parser *parser, Expr *expr) {
     size_t pos = parser->lexer->pos;
     Location location = {.pos = pos};
     if (parser_try_parse_token(parser, TOK_IDENT)) {
-        return expr_ident_create(location, parser->lexer->token->text);
+        *expr = expr_ident_create(location, parser->lexer->token->text);
+        return PARSE_RESULT_OK;
     }
 
     if (parser_try_parse_token(parser, TOK_NUMBER)) {
@@ -379,107 +407,137 @@ Expr parse_identifier_or_literal(Parser *parser) {
         if (errno == ERANGE) {
             fprintf(stderr, "failed to parse as double: %s\n", parser->lexer->token->text);
             parser->has_errors = true;
+            return PARSE_RESULT_INVALID_NUMERIC_LITERAL;
         }
-        return expr_num_create(location, value);
+        *expr = expr_num_create(location, value);
+        return PARSE_RESULT_OK;
     }
 
-    fprintf(stderr, "expected identifier but got a literal\n");
+    fprintf(stderr, "expected identifier or a literal but got %s\n", token_type_name(parser->lexer->token->type));
     parser->has_errors = true;
-    lexer_scan(parser->lexer);
 
-    Expr expr = expr_ident_create(location, "(missing)");
-    return expr;
+    return PARSE_RESULT_UNEXPECTED_TOK;
 }
 
-Expr parse_expression(Parser *parser) {
+ParseResult parse_expression(Parser *parser, Expr *expr) {
     size_t pos = parser->lexer->pos;
     Location location = {.pos = pos};
 
-    Expr expr = parse_identifier_or_literal(parser);
-    if (expr.type == EXPR_IDENT && parser_try_parse_token(parser, TOK_EQ)) {
+    TRY_PARSE(parse_identifier_or_literal(parser, expr));
+
+    if (expr->type == EXPR_IDENT && parser_try_parse_token(parser, TOK_EQ)) {
         Expr *value = malloc(sizeof(Expr));
-        *value = parse_expression(parser);
-        return expr_assignment_create(location, expr.ident, value);
+        TRY_PARSE(parse_expression(parser, value));
+        *expr = expr_assignment_create(location, expr->ident, value);
     }
-    return expr;
+
+    return PARSE_RESULT_OK;
 }
 
-Ident parse_identifier(Parser *parser) {
-    Expr expr = parse_identifier_or_literal(parser);
+ParseResult parse_identifier(Parser *parser, Ident *ident) {
+    Expr expr;
+    TRY_PARSE(parse_identifier_or_literal(parser, &expr));
     if (expr.type == EXPR_IDENT) {
-        return expr.ident;
+        *ident = expr.ident;
+        return PARSE_RESULT_OK;
     }
 
-    fprintf(stderr, "expected identifier but got a literal\n");
+    fprintf(stderr, "expected identifier but got a token of type %s\n", token_type_name(parser->lexer->token->type));
     parser->has_errors = true;
-    Ident ident = {
-            .text = "(missing)",
-    };
-    return ident;
+    return PARSE_RESULT_UNEXPECTED_TOK;
 }
 
-Stmt parse_stmt(Parser *parser) {
+ParseResult parse_stmt(Parser *parser, Stmt *stmt) {
     size_t pos = parser->lexer->pos;
     Location location = {.pos = pos};
 
     if (parser_try_parse_token(parser, TOK_LET)) {
-        Ident name = parse_identifier(parser);
+        // let $name: $type_name = $expr;
+        Ident name;
+        TRY_PARSE(parse_identifier(parser, &name));
+
         Ident *type_name = NULL;
         if (parser_try_parse_token(parser, TOK_COLON)) {
             type_name = malloc(sizeof(Ident));
-            *type_name = parse_identifier(parser);
+            TRY_PARSE(parse_identifier(parser, type_name));
         }
-        parser_expect_token(parser, TOK_EQ);
-        Expr init = parse_expression(parser);
+
+        TRY_PARSE(parser_expect_token(parser, TOK_EQ));
+
+        Expr init;
+        TRY_PARSE(parse_expression(parser, &init));
         Decl decl = decl_let_create(location, name, type_name, init);
-        return stmt_decl_create(location, decl);
-    }
+        *stmt = stmt_decl_create(location, decl);
+    } else if (parser_try_parse_token(parser, TOK_TYPE)) {
+        // type $name = $type_name;
+        Ident name;
+        TRY_PARSE(parse_identifier(parser, &name));
 
-    if (parser_try_parse_token(parser, TOK_TYPE)) {
-        Ident name = parse_identifier(parser);
-        parser_expect_token(parser, TOK_EQ);
-        Ident type_name = parse_identifier(parser);
+        TRY_PARSE(parser_expect_token(parser, TOK_EQ));
+
+        Ident type_name;
+        TRY_PARSE(parse_identifier(parser, &type_name));
+
         Decl decl = decl_type_alias_create(location, name, type_name);
-        return stmt_decl_create(location, decl);
+        *stmt = stmt_decl_create(location, decl);
+    } else {
+        // $expr;
+        Expr expr;
+        TRY_PARSE(parse_expression(parser, &expr));
+        *stmt = stmt_expr_create(location, expr);
     }
 
-    Expr expr = parse_expression(parser);
-    return stmt_expr_create(location, expr);
+    TRY_PARSE(parser_expect_token(parser, TOK_SEMICOLON));
+    return PARSE_RESULT_OK;
 }
 
-Module *parser_parse_module(Parser *parser) {
+ParseResult parser_parse_module(Parser *parser, Module *mod) {
+    lexer_scan(parser->lexer);
+    if (parser_try_parse_token(parser, TOK_END_OF_FILE)) {
+        return PARSE_RESULT_OK;
+    }
+
+    while (true) {
+        Stmt stmt;
+        ParseResult res = parse_stmt(parser, &stmt);
+        if (res != PARSE_RESULT_OK) {
+            return res;
+        }
+        sb_push(mod->statements, stmt);
+
+        if (parser_try_parse_token(parser, TOK_END_OF_FILE)) {
+            break;
+        }
+    }
+
+    return PARSE_RESULT_OK;
+}
+
+ParseResult parser_parse(Parser *parser, Module *module) {
+    return parser_parse_module(parser, module);
+}
+
+int main(int argc, char **argv) {
+    char *source;
+    if (argc > 1) {
+        source = argv[1];
+    } else {
+        source = "let a = 1;\n"
+                 "let b: number = 2;\n"
+                 "let c = a = b;";
+    }
+
+    Parser *parser = parser_create(lexer_create(source));
+
     Stmt *statements = NULL;
     Module *mod = malloc(sizeof(Module));
     mod->statements = statements;
+    ParseResult res = parser_parse(parser, mod);
 
-    lexer_scan(parser->lexer);
-    if (parser_try_parse_token(parser, TOK_END_OF_FILE)) {
-        return mod;
-    }
-
-    sb_push(statements, parse_stmt(parser));
-    while (parser_try_parse_token(parser, TOK_SEMICOLON) && parser->lexer->token->type != TOK_END_OF_FILE) {
-        sb_push(statements, parse_stmt(parser));
-    }
-    parser_expect_token(parser, TOK_END_OF_FILE);
-
-    return mod;
-}
-
-Module *parser_parse(Parser *parser) {
-    return parser_parse_module(parser);
-}
-
-int main() {
-    char *source = "let a = 1;\n"
-                   "let b: number = 2;\n"
-                   "let c = a = b;";
-    Parser *parser = parser_create(lexer_create(source));
-    parser_parse(parser);
-    if (parser->has_errors) {
-        printf("something's not quite right\n");
+    if (res != PARSE_RESULT_OK) {
+        printf("failed to parse: %s\n", parse_result_name(res));
         return 1;
     }
-    printf("all ok\n");
+
     return 0;
 }
