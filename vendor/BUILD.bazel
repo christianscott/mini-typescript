@@ -1,0 +1,5 @@
+cc_library(
+    name = "stretchy_buffer",
+    srcs = ["stretchy_buffer.h"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,5 @@
+cc_binary(
+    name = "ts",
+    srcs = glob(["*.c", "*.h"], allow_empty = False),
+    deps = ["//vendor:stretchy_buffer"],
+)
